@@ -1,0 +1,7 @@
+network:
+  ethernets:
+    enp0s2:
+      dhcp4: false
+      addresses:
+        - {{ internal_ip }}/{{ internal_subnet }}
+  version: 2

@@ -1,0 +1,221 @@
+---
+- name: Playbook to setup and update ubuntu servers
+  hosts: ubuntuhosts
+  become: true
+  gather_facts: true
+  tasks:
+    # ROOT
+    # Set root password in case sudo doesn't work anymore
+    - name: Set root password
+      ansible.builtin.user:
+        name: "root"
+        state: present
+        password: "{{ root_password | password_hash(pw_hash_alg, root_pw_salt) }}"
+
+    # UPDATE
+    - name: Update apt repo and cache
+      ansible.builtin.apt:
+        update_cache: true
+        force_apt_get: true
+        cache_valid_time: 3600
+    - name: Upgrade all apt packages
+      ansible.builtin.apt:
+        upgrade: dist
+        force_apt_get: true
+
+    # INSTALL
+    - name: Install default packages via apt
+      ansible.builtin.apt:
+        name:
+          - vim
+          - git
+          - openjdk-17-jdk-headless
+          - ntp
+          - net-tools
+        state: present
+    - name: Install snaps packages
+      community.general.snap:
+        name:
+          - docker
+    - name: Update snap docker
+      ansible.builtin.command: snap refresh docker
+      register: snap_refresh_docker_result
+      changed_when: '"has no updates available" not in snap_refresh_docker_result.stderr'
+
+    # GROUPS
+    # Create groups used in config
+    - name: Create ssh group
+      ansible.builtin.group:
+        name: ssh
+        state: present
+        system: true
+    - name: Create sudo group
+      ansible.builtin.group:
+        name: sudo
+        state: present
+        system: true
+    - name: Create docker group
+      ansible.builtin.group:
+        name: docker
+        state: present
+        system: true
+
+    - name: Allow sudoers group to use sudo without password
+      community.general.sudoers:
+        name: allow-sudo-group
+        state: present
+        group: sudo
+        commands: ALL
+        nopassword: true
+        validation: required
+    - name: Allow docker socket to docker group
+      ansible.builtin.file:
+        path: /var/run/docker.sock
+        owner: root
+        group: docker
+        mode: "0660"
+
+    # USERS
+    - name: Create local users
+      ansible.builtin.user:
+        name: "{{ item.user_name }}"
+        state: present
+        password: "{{ item.user_pass | password_hash(pw_hash_alg, user_pw_salt) }}"
+        groups: "{{ item.groups }}"
+        generate_ssh_key: true
+        ssh_key_bits: "{{ ssh_key_bits }}"
+      with_items: "{{ user_details }}"
+      no_log: true
+    - name: Set authorized keys taken from file
+      ansible.posix.authorized_key:
+        user: "{{ item.user_name }}"
+        state: present
+        key: "{{ lookup('file', item.ssh_pub_key) }}"
+      with_items: "{{ user_details }}"
+      loop_control:
+        label: "{{ item.user_name }}"
+
+    # remove users we don't have in our valid_users array
+    - name: Evaluate existing users on hosts
+      ansible.builtin.shell: "set -o pipefail && getent passwd | awk -F: '$3 > 999 {print $1}'"
+      args:
+        executable: /bin/bash # "set -o pipefail" fails without this on ubuntu
+      register: existing_users
+      changed_when: false
+    - name: Determine which users to delete
+      ansible.builtin.set_fact:
+        removed_users: "{{ existing_users.stdout_lines | difference(valid_users) }}"
+    - name: Delete users not in valid_users array
+      ansible.builtin.user:
+        name: "{{ item }}"
+        state: absent
+        remove: true
+      with_items: "{{ removed_users }}"
+
+    # NETWORK
+    - name: Add netplan config file for internal networking
+      ansible.builtin.template:
+        src: ./ubuntuhosts/etc/netplan/01-hostnet.yaml.j2
+        dest: /etc/netplan/01-hostnet.yaml
+        owner: root
+        group: root
+        mode: "0644"
+      notify:
+        - Apply netplan config if changed
+
+    # Add internal addresses to /etc/hosts of all hosts
+    - name: Remove external ips from /etc/hosts
+      ansible.builtin.lineinfile:
+        dest: /etc/hosts
+        regexp: "^{{hostvars[item]['ansible_default_ipv4']['address']}}.*$"
+        state: absent
+      with_items: "{{ groups.all }}"
+    - name: Add IP address of all hosts to all hosts
+      ansible.builtin.lineinfile:
+        dest: /etc/hosts
+        regexp: "^.*{{ item }}.*$"
+        line: "{{ hostvars[item].internal_ip }} {{item}}"
+        state: present
+      when: hostvars[item].internal_ip is defined
+      with_items: "{{ groups.ubuntuhosts }}"
+
+    # DEFAULT SETTINGS
+    # vim
+    - name: Use vim as default editor
+      community.general.alternatives:
+        name: editor
+        path: /usr/bin/vim.basic
+
+    # FIREWALL
+    - name: Enable UFW and don't allow anything by default
+      community.general.ufw:
+        state: enabled
+        default: deny
+    - name: Limit SSH access
+      community.general.ufw:
+        rule: limit
+        port: "{{ ssh_port }}"
+        proto: tcp
+
+    # NTP
+    - name: NTP ignore wildcards
+      ansible.builtin.lineinfile:
+        dest: /etc/ntp.conf
+        regexp: "^{{ item }}$"
+        line: "{{ item }}"
+        state: present
+      with_items:
+        - interface ignore wildcard
+        - interface listen 127.0.0.1
+        - interface listen ::1
+      notify:
+        - Restart NTP when config changed
+
+    # SSH
+    - name: Configure SSH
+      ansible.builtin.lineinfile:
+        dest: /etc/ssh/sshd_config
+        regexp: "^{{item.key}} .*$"
+        line: "{{item.key}} {{item.value}}"
+        state: present
+      register: ssh_conf
+      with_items:
+        - { key: "PermitRootLogin", value: "no" }
+        - { key: "PasswordAuthentication", value: "no" }
+        - { key: "AllowGroups", value: "ssh" }
+        - { key: "Port", value: "{{ssh_port}}" }
+      loop_control:
+        label: "{{ item.key }} {{item.value}}"
+    # REBOOT
+    # Reboot hosts if necessary
+    - name: Check if a reboot is needed for Debian and Ubuntu boxes
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+        get_md5: false
+      register: reboot_required_file
+    - name: Reboot the server if required
+      ansible.builtin.reboot:
+        msg: "Reboot initiated by Ansible due to kernel updates"
+        connect_timeout: 5
+        reboot_timeout: 300
+        pre_reboot_delay: 0
+        post_reboot_delay: 30
+        test_command: uptime
+      when: reboot_required_file.stat.exists
+      register: reboot_step
+
+    # restart ssh if changed - last step as this could break further connections
+    # this fails if the step above decides to reboot the server
+    - name: Restart SSH server if conf changed
+      ansible.builtin.service:
+        name: ssh
+        state: restarted
+      when: reboot_step is not changed and ssh_conf.changed
+
+  handlers:
+    - name: Apply netplan config if changed
+      ansible.builtin.command: netplan apply
+    - name: Restart NTP when config changed
+      ansible.builtin.service:
+        name: ntp
+        state: restarted
