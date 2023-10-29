@@ -33,6 +33,10 @@
           - ntp
           - net-tools
         state: present
+    - name: Update snap
+      ansible.builtin.command: snap refresh
+      register: snap_refresh_result
+      changed_when: '"All snaps up to date" not in snap_refresh_result.stderr'
     - name: Install snaps packages
       community.general.snap:
         name:
