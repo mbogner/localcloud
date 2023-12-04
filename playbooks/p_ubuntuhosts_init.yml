@@ -195,7 +195,6 @@
     - name: Check if a reboot is needed for Debian and Ubuntu boxes
       ansible.builtin.stat:
         path: /var/run/reboot-required
-        get_md5: false
       register: reboot_required_file
     - name: Reboot the server if required
       ansible.builtin.reboot:
@@ -205,7 +204,7 @@
         pre_reboot_delay: 0
         post_reboot_delay: 30
         test_command: uptime
-      when: reboot_required_file.stat.exists
+      when: reboot_required_file.stat.exists == true
       register: reboot_step
 
     # restart ssh if changed - last step as this could break further connections
